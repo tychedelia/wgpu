@@ -94,6 +94,18 @@ pub(super) enum SubAccess {
         value: Handle<crate::Expression>,
         stride: u32,
     },
+
+    /// Select a buffer from a binding array. This is used for storage
+    /// buffer binding arrays where we need to select which buffer in
+    /// the array to access.
+    BufferArrayIndex {
+        index: u32,
+    },
+
+    /// Select a buffer from a binding array with a dynamic index.
+    BufferArrayDynamicIndex {
+        index: Handle<crate::Expression>,
+    },
 }
 
 pub(super) enum StoreValue {
@@ -118,6 +130,35 @@ pub(super) enum StoreValue {
 }
 
 impl<W: fmt::Write> super::Writer<'_, W> {
+    /// Write the storage buffer name with array indexing if needed
+    fn write_storage_buffer_name(
+        &mut self,
+        module: &crate::Module,
+        var_handle: Handle<crate::GlobalVariable>,
+        chain: &[SubAccess],
+        func_ctx: &FunctionCtx,
+    ) -> BackendResult {
+        let var_name = &self.names[&NameKey::GlobalVariable(var_handle)];
+
+        // Check if we have a buffer array index in the chain
+        if let Some(access) = chain.iter().find(|access| matches!(access, SubAccess::BufferArrayIndex { .. } | SubAccess::BufferArrayDynamicIndex { .. })) {
+            match access {
+                SubAccess::BufferArrayIndex { index } => {
+                    write!(self.out, "{var_name}[{index}]")?;
+                }
+                SubAccess::BufferArrayDynamicIndex { index } => {
+                    write!(self.out, "{var_name}[")?;
+                    self.write_expr(module, *index, func_ctx)?;
+                    write!(self.out, "]")?;
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            write!(self.out, "{var_name}")?;
+        }
+        Ok(())
+    }
+
     pub(super) fn write_storage_address(
         &mut self,
         module: &crate::Module,
@@ -141,6 +182,14 @@ impl<W: fmt::Write> super::Writer<'_, W> {
                 SubAccess::Index { value, stride } => {
                     self.write_expr(module, value, func_ctx)?;
                     write!(self.out, "*{stride}")?;
+                }
+                SubAccess::BufferArrayIndex { .. } => {
+                    // Buffer array indexing is handled at the variable name level, not in the address
+                    // So we don't write anything here
+                }
+                SubAccess::BufferArrayDynamicIndex { .. } => {
+                    // Dynamic buffer array indexing is handled at the variable name level, not in the address
+                    // So we don't write anything here
                 }
             }
         }
@@ -187,14 +236,16 @@ impl<W: fmt::Write> super::Writer<'_, W> {
             crate::TypeInner::Scalar(scalar) => {
                 // working around the borrow checker in `self.write_expr`
                 let chain = mem::take(&mut self.temp_access_chain);
-                let var_name = &self.names[&NameKey::GlobalVariable(var_handle)];
                 // See note about DXC and Load/Store in the module's documentation.
                 if scalar.width == 4 {
                     let cast = scalar.kind.to_hlsl_cast();
-                    write!(self.out, "{cast}({var_name}.Load(")?;
+                    write!(self.out, "{cast}(")?;
+                    self.write_storage_buffer_name(module, var_handle, &chain, func_ctx)?;
+                    write!(self.out, ".Load(")?;
                 } else {
                     let ty = scalar.to_hlsl_str()?;
-                    write!(self.out, "{var_name}.Load<{ty}>(")?;
+                    self.write_storage_buffer_name(module, var_handle, &chain, func_ctx)?;
+                    write!(self.out, ".Load<{ty}>(")?;
                 };
                 self.write_storage_address(module, &chain, func_ctx)?;
                 write!(self.out, ")")?;
@@ -598,8 +649,54 @@ impl<W: fmt::Write> super::Writer<'_, W> {
                     }
                     return Ok(handle);
                 }
-                crate::Expression::Access { base, index } => (base, AccessIndex::Expression(index)),
+                crate::Expression::Access { base, index } => {
+                    // Check if we're accessing a binding array
+                    if let crate::Expression::GlobalVariable(var_handle) = func_ctx.expressions[base] {
+                        if let crate::TypeInner::BindingArray { .. } = module.types[module.global_variables[var_handle].ty].inner {
+                            // For binding arrays, the access represents indexing into the array of buffers
+                            // Store the dynamic buffer array index
+                            self.temp_access_chain.push(SubAccess::BufferArrayDynamicIndex {
+                                index,
+                            });
+                            if let Some(ref binding) = module.global_variables[var_handle].binding {
+                                let bt = self.options.resolve_resource_binding(binding).unwrap();
+                                if let Some(dynamic_storage_buffer_offsets_index) =
+                                    bt.dynamic_storage_buffer_offsets_index
+                                {
+                                    self.temp_access_chain.push(SubAccess::BufferOffset {
+                                        group: binding.group,
+                                        offset: dynamic_storage_buffer_offsets_index,
+                                    });
+                                }
+                            }
+                            return Ok(var_handle);
+                        }
+                    }
+                    (base, AccessIndex::Expression(index))
+                },
                 crate::Expression::AccessIndex { base, index } => {
+                    // Check if we're accessing a binding array
+                    if let crate::Expression::GlobalVariable(var_handle) = func_ctx.expressions[base] {
+                        if let crate::TypeInner::BindingArray { .. } = module.types[module.global_variables[var_handle].ty].inner {
+                            // For binding arrays, the access represents indexing into the array of buffers
+                            // Store the buffer array index
+                            self.temp_access_chain.push(SubAccess::BufferArrayIndex {
+                                index,
+                            });
+                            if let Some(ref binding) = module.global_variables[var_handle].binding {
+                                let bt = self.options.resolve_resource_binding(binding).unwrap();
+                                if let Some(dynamic_storage_buffer_offsets_index) =
+                                    bt.dynamic_storage_buffer_offsets_index
+                                {
+                                    self.temp_access_chain.push(SubAccess::BufferOffset {
+                                        group: binding.group,
+                                        offset: dynamic_storage_buffer_offsets_index,
+                                    });
+                                }
+                            }
+                            return Ok(var_handle);
+                        }
+                    }
                     (base, AccessIndex::Constant(index))
                 }
                 ref other => {
@@ -619,6 +716,21 @@ impl<W: fmt::Write> super::Writer<'_, W> {
                         // long each column is.
                         stride: Alignment::from(rows) * scalar.width as u32,
                     },
+                    crate::TypeInner::BindingArray { base, .. } => {
+                        // For binding arrays, we treat the access as accessing the base type
+                        // Each element in the binding array is a separate buffer
+                        match module.types[base].inner {
+                            crate::TypeInner::Struct { ref members, .. } => Parent::Struct(members),
+                            crate::TypeInner::Array { stride, .. } => Parent::Array { stride },
+                            crate::TypeInner::Vector { scalar, .. } => Parent::Array {
+                                stride: scalar.width as u32,
+                            },
+                            crate::TypeInner::Matrix { rows, scalar, .. } => Parent::Array {
+                                stride: Alignment::from(rows) * scalar.width as u32,
+                            },
+                            _ => return Err(Error::Unimplemented(format!("Unsupported binding array base type for storage"))),
+                        }
+                    }
                     _ => unreachable!(),
                 },
                 crate::TypeInner::ValuePointer { scalar, .. } => Parent::Array {
